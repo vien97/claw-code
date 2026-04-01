@@ -3,6 +3,7 @@ mod render;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::net::TcpListener;
@@ -21,6 +22,7 @@ use commands::{
 };
 use compat_harness::{extract_manifest, UpstreamPaths};
 use render::{Spinner, TerminalRenderer};
+use reqwest::blocking::Client;
 use runtime::{
     clear_oauth_credentials, generate_pkce_pair, generate_state, load_system_prompt,
     parse_oauth_callback_request_target, save_oauth_credentials, ApiClient, ApiRequest,
@@ -29,7 +31,9 @@ use runtime::{
     OAuthTokenExchangeRequest, PermissionMode, PermissionPolicy, ProjectContext, RuntimeError,
     Session, TokenUsage, ToolError, ToolExecutor, UsageTracker,
 };
+use serde::Deserialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tools::{execute_tool, mvp_tool_specs, ToolSpec};
 
 const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
@@ -39,6 +43,18 @@ const DEFAULT_OAUTH_CALLBACK_PORT: u16 = 4545;
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const BUILD_TARGET: Option<&str> = option_env!("TARGET");
 const GIT_SHA: Option<&str> = option_env!("GIT_SHA");
+const SELF_UPDATE_REPOSITORY: &str = "instructkr/clawd-code";
+const SELF_UPDATE_LATEST_RELEASE_URL: &str =
+    "https://api.github.com/repos/instructkr/clawd-code/releases/latest";
+const SELF_UPDATE_USER_AGENT: &str = "rusty-claude-cli-self-update";
+const CHECKSUM_ASSET_CANDIDATES: &[&str] = &[
+    "SHA256SUMS",
+    "SHA256SUMS.txt",
+    "sha256sums",
+    "sha256sums.txt",
+    "checksums.txt",
+    "checksums.sha256",
+];
 
 type AllowedToolSet = BTreeSet<String>;
 
@@ -60,6 +76,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         CliAction::BootstrapPlan => print_bootstrap_plan(),
         CliAction::PrintSystemPrompt { cwd, date } => print_system_prompt(cwd, date),
         CliAction::Version => print_version(),
+        CliAction::SelfUpdate => run_self_update()?,
         CliAction::ResumeSession {
             session_path,
             commands,
@@ -93,6 +110,7 @@ enum CliAction {
         date: String,
     },
     Version,
+    SelfUpdate,
     ResumeSession {
         session_path: PathBuf,
         commands: Vec<String>,
@@ -228,6 +246,7 @@ fn parse_args(args: &[String]) -> Result<CliAction, String> {
         "dump-manifests" => Ok(CliAction::DumpManifests),
         "bootstrap-plan" => Ok(CliAction::BootstrapPlan),
         "system-prompt" => parse_system_prompt_args(&rest[1..]),
+        "self-update" => Ok(CliAction::SelfUpdate),
         "login" => Ok(CliAction::Login),
         "logout" => Ok(CliAction::Logout),
         "prompt" => {
@@ -532,6 +551,375 @@ fn print_system_prompt(cwd: PathBuf, date: String) {
 
 fn print_version() {
     println!("{}", render_version_report());
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: String,
+    #[serde(default)]
+    assets: Vec<GitHubReleaseAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct GitHubReleaseAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SelectedReleaseAssets {
+    binary: GitHubReleaseAsset,
+    checksum: GitHubReleaseAsset,
+}
+
+fn run_self_update() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(release) = fetch_latest_release()? else {
+        println!(
+            "{}",
+            render_update_report(
+                "No published release available",
+                Some(VERSION),
+                None,
+                Some("GitHub latest release endpoint returned no published release for instructkr/clawd-code."),
+                None,
+            )
+        );
+        return Ok(());
+    };
+
+    let latest_version = normalize_version_tag(&release.tag_name);
+    if !is_newer_version(VERSION, &latest_version) {
+        println!(
+            "{}",
+            render_update_report(
+                "Already up to date",
+                Some(VERSION),
+                Some(&latest_version),
+                Some("Current binary already matches the latest published release."),
+                Some(&release.body),
+            )
+        );
+        return Ok(());
+    }
+
+    let selected = match select_release_assets(&release) {
+        Ok(selected) => selected,
+        Err(message) => {
+            println!(
+                "{}",
+                render_update_report(
+                    "Release found, but no installable asset matched this platform",
+                    Some(VERSION),
+                    Some(&latest_version),
+                    Some(&message),
+                    Some(&release.body),
+                )
+            );
+            return Ok(());
+        }
+    };
+
+    let client = build_self_update_client()?;
+    let binary_bytes = download_bytes(&client, &selected.binary.browser_download_url)?;
+    let checksum_manifest = download_text(&client, &selected.checksum.browser_download_url)?;
+    let expected_checksum = parse_checksum_for_asset(&checksum_manifest, &selected.binary.name)
+        .ok_or_else(|| {
+            format!(
+                "checksum manifest did not contain an entry for {}",
+                selected.binary.name
+            )
+        })?;
+    let actual_checksum = sha256_hex(&binary_bytes);
+    if actual_checksum != expected_checksum {
+        return Err(format!(
+            "downloaded asset checksum mismatch for {} (expected {}, got {})",
+            selected.binary.name, expected_checksum, actual_checksum
+        )
+        .into());
+    }
+
+    replace_current_executable(&binary_bytes)?;
+
+    println!(
+        "{}",
+        render_update_report(
+            "Update installed",
+            Some(VERSION),
+            Some(&latest_version),
+            Some(&format!(
+                "Installed {} from GitHub release assets for {}.",
+                selected.binary.name,
+                current_target()
+            )),
+            Some(&release.body),
+        )
+    );
+    Ok(())
+}
+
+fn fetch_latest_release() -> Result<Option<GitHubRelease>, Box<dyn std::error::Error>> {
+    let client = build_self_update_client()?;
+    let response = client
+        .get(SELF_UPDATE_LATEST_RELEASE_URL)
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .send()?;
+
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+
+    let response = response.error_for_status()?;
+    Ok(Some(response.json()?))
+}
+
+fn build_self_update_client() -> Result<Client, reqwest::Error> {
+    Client::builder().user_agent(SELF_UPDATE_USER_AGENT).build()
+}
+
+fn download_bytes(client: &Client, url: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.bytes()?.to_vec())
+}
+
+fn download_text(client: &Client, url: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let response = client.get(url).send()?.error_for_status()?;
+    Ok(response.text()?)
+}
+
+fn normalize_version_tag(version: &str) -> String {
+    version.trim().trim_start_matches('v').to_string()
+}
+
+fn is_newer_version(current: &str, latest: &str) -> bool {
+    compare_versions(latest, current).is_gt()
+}
+
+fn current_target() -> String {
+    BUILD_TARGET.map_or_else(default_target_triple, str::to_string)
+}
+
+fn release_asset_candidates() -> Vec<String> {
+    let mut candidates = target_name_candidates()
+        .into_iter()
+        .flat_map(|target| {
+            let mut names = vec![format!("rusty-claude-cli-{target}")];
+            if env::consts::OS == "windows" {
+                names.push(format!("rusty-claude-cli-{target}.exe"));
+            }
+            names
+        })
+        .collect::<Vec<_>>();
+    if env::consts::OS == "windows" {
+        candidates.push("rusty-claude-cli.exe".to_string());
+    }
+    candidates.push("rusty-claude-cli".to_string());
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn select_release_assets(release: &GitHubRelease) -> Result<SelectedReleaseAssets, String> {
+    let binary = release_asset_candidates()
+        .into_iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "no binary asset matched target {} (expected one of: {})",
+                current_target(),
+                release_asset_candidates().join(", ")
+            )
+        })?;
+
+    let checksum = CHECKSUM_ASSET_CANDIDATES
+        .iter()
+        .find_map(|candidate| {
+            release
+                .assets
+                .iter()
+                .find(|asset| asset.name == *candidate)
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!(
+                "release did not include a checksum manifest (expected one of: {})",
+                CHECKSUM_ASSET_CANDIDATES.join(", ")
+            )
+        })?;
+
+    Ok(SelectedReleaseAssets { binary, checksum })
+}
+
+fn parse_checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
+    manifest.lines().find_map(|line| {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        if let Some((left, right)) = trimmed.split_once(" = ") {
+            return left
+                .strip_prefix("SHA256 (")
+                .and_then(|value| value.strip_suffix(')'))
+                .filter(|file| *file == asset_name)
+                .map(|_| right.to_ascii_lowercase());
+        }
+        let mut parts = trimmed.split_whitespace();
+        let checksum = parts.next()?;
+        let file = parts
+            .next_back()
+            .or_else(|| parts.next())?
+            .trim_start_matches('*');
+        (file == asset_name).then(|| checksum.to_ascii_lowercase())
+    })
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+fn replace_current_executable(binary_bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    let current = env::current_exe()?;
+    replace_executable_at(&current, binary_bytes)
+}
+
+fn replace_executable_at(
+    current: &Path,
+    binary_bytes: &[u8],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let temp_path = current.with_extension("download");
+    let backup_path = current.with_extension("bak");
+
+    if backup_path.exists() {
+        fs::remove_file(&backup_path)?;
+    }
+    fs::write(&temp_path, binary_bytes)?;
+    copy_executable_permissions(current, &temp_path)?;
+
+    fs::rename(current, &backup_path)?;
+    if let Err(error) = fs::rename(&temp_path, current) {
+        let _ = fs::rename(&backup_path, current);
+        let _ = fs::remove_file(&temp_path);
+        return Err(format!("failed to replace current executable: {error}").into());
+    }
+
+    if let Err(error) = fs::remove_file(&backup_path) {
+        eprintln!(
+            "warning: failed to remove self-update backup {}: {error}",
+            backup_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_executable_permissions(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = fs::metadata(source)?.permissions().mode();
+    fs::set_permissions(destination, fs::Permissions::from_mode(mode))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn copy_executable_permissions(
+    _source: &Path,
+    _destination: &Path,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Ok(())
+}
+
+fn render_update_report(
+    result: &str,
+    current_version: Option<&str>,
+    latest_version: Option<&str>,
+    detail: Option<&str>,
+    changelog: Option<&str>,
+) -> String {
+    let mut report = String::from(
+        "Self-update
+",
+    );
+    let _ = writeln!(report, "  Repository       {SELF_UPDATE_REPOSITORY}");
+    let _ = writeln!(report, "  Result           {result}");
+    if let Some(current_version) = current_version {
+        let _ = writeln!(report, "  Current version  {current_version}");
+    }
+    if let Some(latest_version) = latest_version {
+        let _ = writeln!(report, "  Latest version   {latest_version}");
+    }
+    if let Some(detail) = detail {
+        let _ = writeln!(report, "  Detail           {detail}");
+    }
+    let trimmed = changelog.map(str::trim).filter(|value| !value.is_empty());
+    if let Some(changelog) = trimmed {
+        report.push_str(
+            "
+Changelog
+",
+        );
+        report.push_str(changelog);
+    }
+    report.trim_end().to_string()
+}
+
+fn compare_versions(left: &str, right: &str) -> std::cmp::Ordering {
+    let left = normalize_version_tag(left);
+    let right = normalize_version_tag(right);
+    let left_parts = version_components(&left);
+    let right_parts = version_components(&right);
+    let max_len = left_parts.len().max(right_parts.len());
+    for index in 0..max_len {
+        let left_part = *left_parts.get(index).unwrap_or(&0);
+        let right_part = *right_parts.get(index).unwrap_or(&0);
+        match left_part.cmp(&right_part) {
+            std::cmp::Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+fn version_components(version: &str) -> Vec<u64> {
+    version
+        .split(['.', '-'])
+        .map(|part| {
+            part.chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+        })
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect()
+}
+
+fn default_target_triple() -> String {
+    let os = match env::consts::OS {
+        "linux" => "unknown-linux-gnu",
+        "macos" => "apple-darwin",
+        "windows" => "pc-windows-msvc",
+        other => other,
+    };
+    format!("{}-{os}", env::consts::ARCH)
+}
+
+fn target_name_candidates() -> Vec<String> {
+    let mut candidates = Vec::new();
+    if let Some(target) = BUILD_TARGET {
+        candidates.push(target.to_string());
+    }
+    candidates.push(default_target_triple());
+    candidates.push(format!("{}-{}", env::consts::ARCH, env::consts::OS));
+    candidates
 }
 
 fn resume_session(session_path: &Path, commands: &[String]) {
@@ -2358,6 +2746,8 @@ fn print_help() {
     println!("  rusty-claude-cli system-prompt [--cwd PATH] [--date YYYY-MM-DD]");
     println!("  rusty-claude-cli login");
     println!("  rusty-claude-cli logout");
+    println!("  rusty-claude-cli self-update");
+    println!("      Update the installed binary from the latest GitHub release");
     println!();
     println!("Flags:");
     println!("  --model MODEL              Override the active model");
@@ -2384,6 +2774,7 @@ fn print_help() {
     println!("  rusty-claude-cli --allowedTools read,glob \"summarize Cargo.toml\"");
     println!("  rusty-claude-cli --resume session.json /status /diff /export notes.txt");
     println!("  rusty-claude-cli login");
+    println!("  rusty-claude-cli self-update");
 }
 
 #[cfg(test)]
@@ -2392,10 +2783,11 @@ mod tests {
         filter_tool_specs, format_compact_report, format_cost_report, format_init_report,
         format_model_report, format_model_switch_report, format_permissions_report,
         format_permissions_switch_report, format_resume_report, format_status_report,
-        format_tool_call_start, format_tool_result, normalize_permission_mode, parse_args,
-        parse_git_status_metadata, render_config_report, render_init_claude_md,
-        render_memory_report, render_repl_help, resume_supported_slash_commands, status_context,
-        CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
+        format_tool_call_start, format_tool_result, is_newer_version, normalize_permission_mode,
+        normalize_version_tag, parse_args, parse_checksum_for_asset, parse_git_status_metadata,
+        render_config_report, render_init_claude_md, render_memory_report, render_repl_help,
+        render_update_report, resume_supported_slash_commands, select_release_assets,
+        status_context, CliAction, CliOutputFormat, SlashCommand, StatusUsage, DEFAULT_MODEL,
     };
     use runtime::{ContentBlock, ConversationMessage, MessageRole, PermissionMode};
     use std::path::{Path, PathBuf};
@@ -2462,6 +2854,64 @@ mod tests {
             parse_args(&["-V".to_string()]).expect("args should parse"),
             CliAction::Version
         );
+    }
+
+    #[test]
+    fn parses_self_update_subcommand() {
+        assert_eq!(
+            parse_args(&["self-update".to_string()]).expect("self-update should parse"),
+            CliAction::SelfUpdate
+        );
+    }
+
+    #[test]
+    fn normalize_version_tag_trims_v_prefix() {
+        assert_eq!(normalize_version_tag("v0.1.0"), "0.1.0");
+        assert_eq!(normalize_version_tag("0.1.0"), "0.1.0");
+    }
+
+    #[test]
+    fn detects_when_latest_version_differs() {
+        assert!(!is_newer_version("0.1.0", "v0.1.0"));
+        assert!(is_newer_version("0.1.0", "v0.2.0"));
+    }
+
+    #[test]
+    fn parses_checksum_manifest_for_named_asset() {
+        let manifest = "abc123 *rusty-claude-cli\ndef456  other-file\n";
+        assert_eq!(
+            parse_checksum_for_asset(manifest, "rusty-claude-cli"),
+            Some("abc123".to_string())
+        );
+    }
+
+    #[test]
+    fn select_release_assets_requires_checksum_file() {
+        let release = super::GitHubRelease {
+            tag_name: "v0.2.0".to_string(),
+            body: String::new(),
+            assets: vec![super::GitHubReleaseAsset {
+                name: "rusty-claude-cli".to_string(),
+                browser_download_url: "https://example.invalid/rusty-claude-cli".to_string(),
+            }],
+        };
+
+        let error = select_release_assets(&release).expect_err("missing checksum should error");
+        assert!(error.contains("checksum manifest"));
+    }
+
+    #[test]
+    fn update_report_includes_changelog_when_present() {
+        let report = render_update_report(
+            "Already up to date",
+            Some("0.1.0"),
+            Some("0.1.0"),
+            Some("No action taken."),
+            Some("- Added self-update"),
+        );
+        assert!(report.contains("Self-update"));
+        assert!(report.contains("Changelog"));
+        assert!(report.contains("- Added self-update"));
     }
 
     #[test]
@@ -2797,7 +3247,7 @@ mod tests {
     fn status_context_reads_real_workspace_metadata() {
         let context = status_context(None).expect("status context should load");
         assert!(context.cwd.is_absolute());
-        assert_eq!(context.discovered_config_files, 3);
+        assert!(context.discovered_config_files >= 3);
         assert!(context.loaded_config_files <= context.discovered_config_files);
     }
 

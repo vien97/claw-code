@@ -84,6 +84,15 @@ cargo run -p rusty-claude-cli -- logout
 
 This removes only the stored OAuth credentials and preserves unrelated JSON fields in `credentials.json`.
 
+### Self-update
+
+```bash
+cd rust
+cargo run -p rusty-claude-cli -- self-update
+```
+
+The command checks the latest GitHub release for `instructkr/clawd-code`, compares it to the current binary version, downloads the matching binary asset plus checksum manifest, verifies SHA-256, replaces the current executable, and prints the release changelog. If no published release or matching asset exists, it exits safely with an explanatory message.
+
 ## Usage examples
 
 ### 1) Prompt mode
@@ -162,6 +171,7 @@ cargo run -p rusty-claude-cli -- --resume session.json /memory /config
 - `dump-manifests` — print extracted upstream manifest counts
 - `bootstrap-plan` — print the current bootstrap skeleton
 - `system-prompt [--cwd PATH] [--date YYYY-MM-DD]` — render the synthesized system prompt
+- `self-update` — update the installed binary from the latest GitHub release when a matching asset is available
 - `--help` / `-h` — show CLI help
 - `--version` / `-V` — print the CLI version and build info locally (no API call)
 - `--output-format text|json` — choose non-interactive prompt output rendering
